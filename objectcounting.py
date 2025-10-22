@@ -195,7 +195,7 @@ class CameraAutoTracker:
     
     def __init__(self, camera_ip='192.168.11.206', camera_port=80, 
                  username='admin', password='admin@1234', 
-                 border_padding=0.15, movement_cooldown=2.0):
+                 border_padding=0.15, movement_cooldown=2.0, movement_duration=0.3):
         """
         Initialize camera auto-tracker
         
@@ -206,6 +206,7 @@ class CameraAutoTracker:
             password: Camera password
             border_padding: Border zone size as percentage of frame (0.0-0.5)
             movement_cooldown: Minimum seconds between camera movements
+            movement_duration: Duration of each camera movement in seconds (0.1-2.0)
         """
         self.camera_ip = camera_ip
         self.camera_port = camera_port
@@ -213,6 +214,7 @@ class CameraAutoTracker:
         self.password = password
         self.border_padding = max(0.05, min(0.4, border_padding))  # Clamp between 5-40%
         self.movement_cooldown = movement_cooldown
+        self.movement_duration = max(0.1, min(2.0, movement_duration))  # Clamp between 0.1-2.0 seconds
         
         # Movement state
         self.last_movement_time = 0
@@ -305,7 +307,7 @@ class CameraAutoTracker:
         
         return None
     
-    def move_camera(self, direction, timeout=1):
+    def move_camera(self, direction):
         """Move camera in specified direction"""
         if not self.camera_initialized or not self.ptz or not self.request:
             return False
@@ -317,17 +319,17 @@ class CameraAutoTracker:
         
         try:
             if direction == 'left':
-                print("[CAMERA] Moving left to track person")
-                move_left(self.ptz, self.request, timeout)
+                print(f"[CAMERA] Moving left ({self.movement_duration}s) to track person")
+                move_left(self.ptz, self.request, self.movement_duration)
             elif direction == 'right':
-                print("[CAMERA] Moving right to track person")
-                move_right(self.ptz, self.request, timeout)
+                print(f"[CAMERA] Moving right ({self.movement_duration}s) to track person")
+                move_right(self.ptz, self.request, self.movement_duration)
             elif direction == 'top':
-                print("[CAMERA] Moving up to track person")
-                move_up(self.ptz, self.request, timeout)
+                print(f"[CAMERA] Moving up ({self.movement_duration}s) to track person")
+                move_up(self.ptz, self.request, self.movement_duration)
             elif direction == 'bottom':
-                print("[CAMERA] Moving down to track person")
-                move_down(self.ptz, self.request, timeout)
+                print(f"[CAMERA] Moving down ({self.movement_duration}s) to track person")
+                move_down(self.ptz, self.request, self.movement_duration)
             
             self.last_movement_time = current_time
             return True
@@ -570,12 +572,12 @@ def process_video(detector, video_source, output_path=None, display=True,
                  skip_frames=0, max_frames=None, use_gstreamer=True,
                  enable_tracking=True, camera_ip='192.168.11.206', 
                  camera_port=80, camera_username='admin', camera_password='admin@1234',
-                 border_padding=0.15, movement_cooldown=2.0):
+                 border_padding=0.15, movement_cooldown=2.0, movement_duration=0.3):
     """
     Process video file or stream with optional camera tracking
     
     Args:
-        detector: TritonPersonDetector instance
+        detector: YOLOPersonDetector instance
         video_source: Video file path, camera index, or RTSP URL
         output_path: Optional path to save output video
         display: Show video window
@@ -589,6 +591,7 @@ def process_video(detector, video_source, output_path=None, display=True,
         camera_password: PTZ camera password
         border_padding: Border zone size as percentage (0.05-0.4)
         movement_cooldown: Minimum seconds between camera movements
+        movement_duration: Duration of each camera movement (0.1-2.0 seconds)
     """
     
     # Initialize camera tracker if enabled
@@ -601,7 +604,8 @@ def process_video(detector, video_source, output_path=None, display=True,
                 username=camera_username,
                 password=camera_password,
                 border_padding=border_padding,
-                movement_cooldown=movement_cooldown
+                movement_cooldown=movement_cooldown,
+                movement_duration=movement_duration
             )
             print(f"[INFO] Camera auto-tracking initialized")
         except Exception as e:
@@ -780,7 +784,7 @@ Examples:
   python objectcounting.py --video 0 --display --border-padding 0.2
   
   # High sensitivity tracking (smaller border zones, faster movement)
-  python objectcounting.py --video 'rtsp://...' --border-padding 0.1 --movement-cooldown 1.0
+  python objectcounting.py --video 'rtsp://...' --border-padding 0.1 --movement-cooldown 1.0 --movement-duration 0.2
   
   # Use custom YOLO model with CPU
   python objectcounting.py --video 'rtsp://...' --model custom_yolo.pt --device cpu
@@ -826,6 +830,8 @@ Examples:
                        help='Border zone size as percentage of frame (0.05-0.4, default: 0.15)')
     parser.add_argument('--movement-cooldown', type=float, default=2.0,
                        help='Minimum seconds between camera movements (default: 2.0)')
+    parser.add_argument('--movement-duration', type=float, default=0.3,
+                       help='Duration of each camera movement in seconds (0.1-2.0, default: 0.3)')
     
     args = parser.parse_args()
     
@@ -838,6 +844,11 @@ Examples:
     border_padding = max(0.05, min(0.4, args.border_padding))
     if border_padding != args.border_padding:
         print(f"[WARNING] Border padding clamped to {border_padding:.2f} (valid range: 0.05-0.4)")
+    
+    # Validate movement duration
+    movement_duration = max(0.1, min(2.0, args.movement_duration))
+    if movement_duration != args.movement_duration:
+        print(f"[WARNING] Movement duration clamped to {movement_duration:.1f}s (valid range: 0.1-2.0)")
     
     # Validate video source (skip check for streams)
     if not args.video.isdigit() and not args.video.startswith(('rtsp://', 'rtmp://', 'http://', 'https://')):
@@ -872,7 +883,8 @@ Examples:
             camera_username=args.camera_username,
             camera_password=args.camera_password,
             border_padding=border_padding,
-            movement_cooldown=args.movement_cooldown
+            movement_cooldown=args.movement_cooldown,
+            movement_duration=movement_duration
         )
     except Exception as e:
         print(f"[ERROR] Video processing failed: {e}")
