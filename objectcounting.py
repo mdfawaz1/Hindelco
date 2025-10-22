@@ -30,7 +30,7 @@ import zeep
 class TritonPersonDetector:
     """Person detection using Triton Inference Server"""
     
-    def __init__(self, model_name, triton_url='192.168.14.182:8001', version='5'):
+    def __init__(self, model_name, triton_url='localhost:8001', version='5'):
         self.model_name = model_name
         self.model_version = version
         
@@ -866,8 +866,8 @@ Examples:
         """
     )
     
-    parser.add_argument('--url', type=str, default='192.168.14.182:8001',
-                       help='Triton gRPC URL (default: 192.168.14.182:8001)')
+    parser.add_argument('--url', type=str, default='localhost:8001',
+                       help='Triton gRPC URL (default: localhost:8001)')
     parser.add_argument('--model', type=str, default='00000000-0000-0000-0000-000000000001',
                        help='Model UUID')
     parser.add_argument('--version', type=str, default='5',
