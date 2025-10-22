@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Video Inference Script for Triton Person Detection with GStreamer
+Video Inference Script for YOLO Person Detection with Auto Camera Tracking
 Processes video files or RTSP streams with hardware-accelerated decoding
+Features automatic PTZ camera tracking when persons approach frame borders
 """
 
 import cv2
 import numpy as np
-import tritonclient.grpc as grpcclient
-from tritonclient.utils import InferenceServerException
+import torch
+from ultralytics import YOLO
 import argparse
 from pathlib import Path
 import time
@@ -27,163 +28,80 @@ from onvif import ONVIFCamera
 import zeep
 
 
-class TritonPersonDetector:
-    """Person detection using Triton Inference Server"""
+class YOLOPersonDetector:
+    """Person detection using YOLO model"""
     
-    def __init__(self, model_name, triton_url='localhost:8001', version='5'):
-        self.model_name = model_name
-        self.model_version = version
+    def __init__(self, model_path='yolov8n.pt', device='auto'):
+        self.model_path = model_path
         
         # Model configuration
-        self.classes = ['HEAD', 'PERSON']
-        self.colors = [(170, 240, 209), (93, 173, 236)]  # BGR
+        self.classes = ['PERSON']  # YOLO COCO class 0 is 'person'
+        self.colors = [(93, 173, 236)]  # BGR color for person
         self.confidence_threshold = 0.25
-        self.maintain_aspect_ratio = True
-        self.symmetric_padding = True
-        self.padding_fill_color = np.array([114, 114, 114], dtype=np.float32)
-        self.normalize_mean = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        self.normalize_std = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        self.person_class_id = 0  # COCO dataset person class ID
         
-        # Connect to Triton
-        print(f"[INFO] Connecting to Triton at {triton_url}...")
+        # Device configuration
+        if device == 'auto':
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
+            
+        print(f"[INFO] Using device: {self.device}")
+        
+        # Load YOLO model
+        print(f"[INFO] Loading YOLO model from {model_path}...")
         try:
-            self.triton_client = grpcclient.InferenceServerClient(url=triton_url, verbose=False)
+            self.model = YOLO(model_path)
+            self.model.to(self.device)
             
-            if not self.triton_client.is_server_live():
-                raise RuntimeError("Triton server is not live")
+            # Get model info
+            print(f"[INFO] Model loaded successfully")
+            print(f"[INFO] Model classes: {len(self.model.names)} classes")
+            print(f"[INFO] Person class available: {'person' in self.model.names.values()}")
             
-            if not self.triton_client.is_model_ready(model_name, version):
-                print(f"[INFO] Loading model {model_name}...")
-                self.triton_client.load_model(model_name)
-                time.sleep(2)
+            # Find person class ID in the model
+            for class_id, class_name in self.model.names.items():
+                if class_name.lower() == 'person':
+                    self.person_class_id = class_id
+                    break
             
-            print(f"[INFO] Model {model_name} ready")
-            
-            # Get model metadata
-            model_metadata = self.triton_client.get_model_metadata(
-                model_name=model_name, model_version=version, as_json=True
-            )
-            
-            model_input = model_metadata["inputs"][0]
-            self.input_height = 640
-            self.input_width = 640
-            
-            # Setup input/output tensors
-            self.inputs = [
-                grpcclient.InferInput(
-                    model_input["name"],
-                    [1, 3, self.input_height, self.input_width],
-                    model_input["datatype"]
-                )
-            ]
-            
-            self.output_names = [output["name"] for output in model_metadata["outputs"]]
-            self.outputs = [grpcclient.InferRequestedOutput(name) for name in self.output_names]
-            
-            print(f"[INFO] Client initialized successfully\n")
+            print(f"[INFO] Person class ID: {self.person_class_id}")
             
         except Exception as e:
-            raise InferenceServerException(f"Failed to initialize: {e}")
-    
-    def preprocess(self, image):
-        """Preprocess image for inference"""
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        h, w, c = image_rgb.shape
-        aspect_ratio = w / h
-        
-        if self.maintain_aspect_ratio:
-            r = min(self.input_width / w, self.input_height / h, 1.0)
-            new_w = int(round(r * w))
-            new_h = int(round(r * h))
-        else:
-            new_w = self.input_width
-            new_h = self.input_height
-        
-        if new_w != w or new_h != h:
-            resized = cv2.resize(image_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        else:
-            resized = image_rgb
-        
-        padded = np.full((c, self.input_height, self.input_width), 
-                        self.padding_fill_color[0], dtype=np.uint8)
-        
-        if self.symmetric_padding:
-            offset_w = (self.input_width - new_w) // 2
-            offset_h = (self.input_height - new_h) // 2
-            padded[:, offset_h:offset_h+new_h, offset_w:offset_w+new_w] = resized.transpose((2, 0, 1))
-        else:
-            padded[:, :new_h, :new_w] = resized.transpose((2, 0, 1))
-        
-        padded = padded.astype(np.float32)
-        padded = (padded - self.normalize_mean[:, None, None] * 255.0) / \
-                 (self.normalize_std[:, None, None] * 255.0)
-        padded = padded[None, ...]
-        
-        return padded, aspect_ratio
-    
-    def postprocess(self, outputs, aspect_ratio, orig_width, orig_height):
-        """Postprocess Triton outputs"""
-        detections = []
-        
-        num_dets = int(outputs[0][0, 0])
-        if num_dets == 0:
-            return detections
-        
-        boxes = outputs[1][0, :num_dets]
-        scores = outputs[2][0, :num_dets]
-        class_ids = outputs[3][0, :num_dets].astype(int)
-        
-        size = np.array([self.input_width, self.input_height, 
-                        self.input_width, self.input_height], dtype=np.float32)
-        boxes = boxes / size
-        
-        if self.maintain_aspect_ratio and self.symmetric_padding:
-            if aspect_ratio > 1.0:
-                boxes -= np.array([0, 0.5, 0, 0.5], dtype=np.float32)
-                boxes *= np.array([1.0, aspect_ratio, 1.0, aspect_ratio], dtype=np.float32)
-                boxes += np.array([0, 0.5, 0, 0.5], dtype=np.float32)
-            else:
-                boxes -= np.array([0.5, 0, 0.5, 0], dtype=np.float32)
-                boxes *= np.array([1.0/aspect_ratio, 1.0, 1.0/aspect_ratio, 1.0], dtype=np.float32)
-                boxes += np.array([0.5, 0, 0.5, 0], dtype=np.float32)
-        
-        boxes = np.clip(boxes, 0.0, 1.0)
-        
-        for box, score, class_id in zip(boxes, scores, class_ids):
-            if score >= self.confidence_threshold and 0 <= class_id < len(self.classes):
-                x1 = int(box[0] * orig_width)
-                y1 = int(box[1] * orig_height)
-                x2 = int(box[2] * orig_width)
-                y2 = int(box[3] * orig_height)
-                
-                if x2 > x1 and y2 > y1:
-                    detections.append({
-                        'bbox': [x1, y1, x2, y2],
-                        'confidence': float(score),
-                        'class_id': int(class_id),
-                        'class_name': self.classes[class_id]
-                    })
-        
-        return detections
+            raise RuntimeError(f"Failed to load YOLO model: {e}")
     
     def infer(self, image):
-        """Run inference"""
-        orig_h, orig_w = image.shape[:2]
-        
-        input_data, aspect_ratio = self.preprocess(image)
-        self.inputs[0].set_data_from_numpy(input_data)
-        
-        response = self.triton_client.infer(
-            model_name=self.model_name,
-            model_version=self.model_version,
-            inputs=self.inputs,
-            outputs=self.outputs
-        )
-        
-        outputs = [response.as_numpy(name) for name in self.output_names]
-        detections = self.postprocess(outputs, aspect_ratio, orig_w, orig_h)
-        
-        return detections
+        """Run YOLO inference"""
+        try:
+            # Run YOLO inference
+            results = self.model(image, conf=self.confidence_threshold, verbose=False)
+            
+            # Convert YOLO results to our detection format
+            detections = []
+            
+            for result in results:
+                boxes = result.boxes
+                if boxes is not None:
+                    for box in boxes:
+                        # Get box coordinates, confidence, and class
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        conf = box.conf[0].cpu().numpy()
+                        class_id = int(box.cls[0].cpu().numpy())
+                        
+                        # Only keep person detections
+                        if class_id == self.person_class_id and conf >= self.confidence_threshold:
+                            detections.append({
+                                'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                                'confidence': float(conf),
+                                'class_id': 0,  # We map all persons to class 0
+                                'class_name': 'PERSON'
+                            })
+            
+            return detections
+            
+        except Exception as e:
+            print(f"[ERROR] YOLO inference failed: {e}")
+            return []
     
     def draw_detections(self, image, detections, show_fps=True, fps=0, 
                        camera_tracker=None, border_zone=None):
@@ -231,9 +149,8 @@ class TritonPersonDetector:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             # Count by class
-            head_count = sum(1 for d in detections if d['class_name'] == 'HEAD')
             person_count = sum(1 for d in detections if d['class_name'] == 'PERSON')
-            cv2.putText(result, f"HEAD: {head_count} | PERSON: {person_count}", 
+            cv2.putText(result, f"PERSONS: {person_count}", 
                        (20, info_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
             # Show camera tracking status
@@ -248,8 +165,12 @@ class TritonPersonDetector:
         return result
     
     def close(self):
-        """Close connection"""
-        self.triton_client.close()
+        """Close YOLO model (cleanup if needed)"""
+        # YOLO models are automatically cleaned up by garbage collection
+        # but we can explicitly delete the model if needed
+        if hasattr(self, 'model'):
+            del self.model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
 
 class FPSCounter:
@@ -842,15 +763,15 @@ def process_video(detector, video_source, output_path=None, display=True,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Video Inference with Triton Person Detection (GStreamer support)',
+        description='Video Inference with YOLO Person Detection and Auto Camera Tracking',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Process RTSP stream with auto-tracking (GStreamer - recommended)
   python objectcounting.py --video 'rtsp://user:pass@192.168.1.100/stream' --display
   
-  # Process RTSP stream with custom camera settings
-  python objectcounting.py --video 'rtsp://...' --camera-ip 192.168.1.200 --camera-password mypass
+  # Process RTSP stream with custom YOLO model
+  python objectcounting.py --video 'rtsp://...' --model yolov8s.pt --device cuda
   
   # Process video file with tracking disabled
   python objectcounting.py --video input.mp4 --output output.mp4 --disable-tracking
@@ -861,17 +782,18 @@ Examples:
   # High sensitivity tracking (smaller border zones, faster movement)
   python objectcounting.py --video 'rtsp://...' --border-padding 0.1 --movement-cooldown 1.0
   
+  # Use custom YOLO model with CPU
+  python objectcounting.py --video 'rtsp://...' --model custom_yolo.pt --device cpu
+  
   # Disable GStreamer (use OpenCV for all sources)
   python objectcounting.py --video 'rtsp://...' --no-gstreamer
         """
     )
     
-    parser.add_argument('--url', type=str, default='localhost:8001',
-                       help='Triton gRPC URL (default: localhost:8001)')
-    parser.add_argument('--model', type=str, default='00000000-0000-0000-0000-000000000001',
-                       help='Model UUID')
-    parser.add_argument('--version', type=str, default='5',
-                       help='Model version')
+    parser.add_argument('--model', type=str, default='yolov8n.pt',
+                       help='YOLO model path (default: yolov8n.pt)')
+    parser.add_argument('--device', type=str, default='auto',
+                       help='Device for YOLO inference: auto, cpu, cuda (default: auto)')
     parser.add_argument('--video', type=str, required=True,
                        help='Video file path, camera index (0 for webcam), or RTSP URL')
     parser.add_argument('--output', type=str, default=None,
@@ -925,14 +847,13 @@ Examples:
     
     # Initialize detector
     try:
-        detector = TritonPersonDetector(
-            model_name=args.model,
-            triton_url=args.url,
-            version=args.version
+        detector = YOLOPersonDetector(
+            model_path=args.model,
+            device=args.device
         )
         detector.confidence_threshold = args.threshold
     except Exception as e:
-        print(f"[ERROR] Failed to initialize detector: {e}")
+        print(f"[ERROR] Failed to initialize YOLO detector: {e}")
         sys.exit(1)
     
     # Process video
